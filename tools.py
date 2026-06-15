@@ -24,6 +24,9 @@ load_dotenv()
 
 # ── Groq client ───────────────────────────────────────────────────────────────
 
+_MODEL = "llama-3.3-70b-versatile"
+
+
 def _get_groq_client():
     """Initialize and return a Groq client using GROQ_API_KEY from .env."""
     api_key = os.environ.get("GROQ_API_KEY")
@@ -32,6 +35,20 @@ def _get_groq_client():
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
     return Groq(api_key=api_key)
+
+
+def _chat(prompt: str, temperature: float = 0.7) -> str:
+    """Send a single user prompt to the LLM and return the response text.
+
+    Raises on any client/API error so callers can apply their own fallback.
+    """
+    client = _get_groq_client()
+    response = client.chat.completions.create(
+        model=_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=temperature,
+    )
+    return (response.choices[0].message.content or "").strip()
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -69,8 +86,74 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # 1. Filter by max_price (inclusive) if a ceiling was given.
+    if max_price is not None:
+        listings = [item for item in listings if item.get("price", 0) <= max_price]
+
+    # 2. Filter by size (case-insensitive substring match) if a size was given.
+    if size:
+        size_lc = size.strip().lower()
+        listings = [
+            item for item in listings
+            if size_lc in str(item.get("size", "")).lower()
+        ]
+
+    # 3. Score each remaining listing by keyword overlap with `description`.
+    keywords = _tokenize(description)
+
+    scored = []
+    for item in listings:
+        score = _score_listing(item, keywords)
+        if score > 0:
+            scored.append((score, item))
+
+    # 4 & 5. Drop zero-score listings (already done) and sort best match first.
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _score, item in scored]
+
+
+# Common filler words that add no search signal.
+_STOPWORDS = {
+    "a", "an", "the", "and", "or", "for", "with", "of", "in", "on", "to",
+    "some", "any", "that", "this", "i", "im", "am", "looking", "want", "need",
+    "size", "under", "over", "below", "above", "less", "than", "around",
+}
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase a string and split it into meaningful keyword tokens."""
+    raw = "".join(c.lower() if c.isalnum() else " " for c in (text or ""))
+    return [tok for tok in raw.split() if len(tok) >= 2 and tok not in _STOPWORDS]
+
+
+def _score_listing(item: dict, keywords: list[str]) -> int:
+    """Score a listing by how many query keywords overlap its searchable fields.
+
+    Matches in the title and style tags are weighted more heavily than matches
+    in the longer free-text description, since they are stronger relevance
+    signals.
+    """
+    if not keywords:
+        return 0
+
+    strong = " ".join([
+        str(item.get("title", "")),
+        " ".join(item.get("style_tags", [])),
+        str(item.get("category", "")),
+        " ".join(item.get("colors", [])),
+        str(item.get("brand") or ""),
+    ]).lower()
+    weak = str(item.get("description", "")).lower()
+
+    score = 0
+    for kw in keywords:
+        if kw in strong:
+            score += 2
+        elif kw in weak:
+            score += 1
+    return score
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +183,60 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    items = (wardrobe or {}).get("items", [])
+
+    item_desc = (
+        f"- Title: {new_item.get('title', 'an item')}\n"
+        f"- Category: {new_item.get('category', 'unknown')}\n"
+        f"- Style tags: {', '.join(new_item.get('style_tags', [])) or 'n/a'}\n"
+        f"- Colors: {', '.join(new_item.get('colors', [])) or 'n/a'}\n"
+        f"- Platform: {new_item.get('platform', 'a secondhand app')}"
+    )
+
+    if not items:
+        # Empty wardrobe → general styling advice, still a useful response.
+        prompt = (
+            "You are a friendly personal stylist. A shopper is considering this "
+            "secondhand item but has not told you anything about their existing "
+            "wardrobe:\n\n"
+            f"{item_desc}\n\n"
+            "Suggest one or two complete outfit ideas using GENERAL clothing "
+            "categories (e.g. 'relaxed denim', 'chunky sneakers', 'a black "
+            "jacket'). Explain what kinds of pieces pair well and what vibe the "
+            "item suits. Keep it to 2-4 sentences, warm and practical."
+        )
+    else:
+        wardrobe_lines = "\n".join(
+            f"- {it.get('name', 'item')} "
+            f"({it.get('category', '')}; "
+            f"colors: {', '.join(it.get('colors', [])) or 'n/a'}; "
+            f"tags: {', '.join(it.get('style_tags', [])) or 'n/a'})"
+            for it in items
+        )
+        prompt = (
+            "You are a friendly personal stylist. A shopper is considering this "
+            "secondhand item:\n\n"
+            f"{item_desc}\n\n"
+            "Here is the shopper's existing wardrobe:\n"
+            f"{wardrobe_lines}\n\n"
+            "Suggest one or two complete outfit ideas that pair the new item with "
+            "SPECIFIC named pieces from the wardrobe above (refer to them by their "
+            "names). Keep it to 2-4 sentences, warm and practical."
+        )
+
+    try:
+        result = _chat(prompt, temperature=0.7)
+        if result:
+            return result
+    except Exception:
+        pass
+
+    # Fallback if the LLM is unavailable or returns nothing.
+    return (
+        "I found the item, but I couldn't generate a detailed outfit suggestion. "
+        "As a backup, style it with simple basics, a complementary shoe, and one "
+        "accessory that matches the item's color or vibe."
+    )
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +268,44 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # 1. Guard against an empty / whitespace-only outfit.
+    if not outfit or not outfit.strip():
+        return (
+            "I can't create a fit card because the outfit suggestion is missing. "
+            "Please generate an outfit first."
+        )
+
+    title = new_item.get("title", "this thrifted piece")
+    price = new_item.get("price")
+    price_str = f"${price:g}" if isinstance(price, (int, float)) else "a steal"
+    platform = new_item.get("platform", "a secondhand app")
+    colors = ", ".join(new_item.get("colors", [])) or "n/a"
+    tags = ", ".join(new_item.get("style_tags", [])) or "n/a"
+
+    prompt = (
+        "Write a short, casual social-media caption (an OOTD / 'thrift haul' "
+        "post) for the outfit below. It should:\n"
+        "- Be 2-4 sentences, lowercase-friendly and authentic, NOT a product "
+        "description.\n"
+        f"- Mention the item ('{title}'), its price ({price_str}), and the "
+        f"platform ({platform}) naturally, each once.\n"
+        "- Capture the specific vibe of the outfit.\n"
+        "- Avoid hashtags and emojis.\n\n"
+        f"Item colors: {colors}\n"
+        f"Item style: {tags}\n"
+        f"Outfit: {outfit}\n\n"
+        "Caption:"
+    )
+
+    # 2 & 3. Higher temperature so repeated calls vary; fall back on failure.
+    try:
+        result = _chat(prompt, temperature=0.95)
+        if result:
+            return result
+    except Exception:
+        pass
+
+    return (
+        f"thrifted this {title.lower()} on {platform} for {price_str} and i'm "
+        f"obsessed. {outfit.strip()}"
+    )

@@ -18,7 +18,50 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
+
+
+# ── query parsing ───────────────────────────────────────────────────────────────
+
+# Price phrases like "under $30", "below 30", "less than $25".
+_PRICE_RE = re.compile(
+    r"(?:under|below|less\s+than|cheaper\s+than|no\s+more\s+than|max(?:imum)?|within)"
+    r"\s*\$?\s*(\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+
+# Size phrases like "size M", "in size 8", "size XXS".
+_SIZE_RE = re.compile(r"\b(?:in\s+)?size\s+([a-z0-9]+)\b", re.IGNORECASE)
+
+
+def _parse_query(query: str) -> dict:
+    """Extract description, size, and max_price from a natural language query.
+
+    Uses regex + string cleanup (not the LLM) because expected queries are
+    simple — see the Planning Loop section of planning.md. The price and size
+    phrases are stripped out so that what remains is the search description.
+    """
+    text = query or ""
+    max_price = None
+    size = None
+
+    price_match = _PRICE_RE.search(text)
+    if price_match:
+        max_price = float(price_match.group(1))
+        text = text[: price_match.start()] + " " + text[price_match.end():]
+
+    size_match = _SIZE_RE.search(text)
+    if size_match:
+        size = size_match.group(1).upper()
+        text = text[: size_match.start()] + " " + text[size_match.end():]
+
+    # Whatever is left, minus stray currency symbols / punctuation, is the search.
+    description = re.sub(r"[\$,]", " ", text)
+    description = re.sub(r"\s+", " ", description).strip()
+
+    return {"description": description, "size": size, "max_price": max_price}
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -92,9 +135,55 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: Initialize the session.
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: Parse the query into description / size / max_price.
+    session["parsed"] = _parse_query(query)
+
+    # Step 3: Search listings with the parsed parameters.
+    results = search_listings(
+        description=session["parsed"]["description"],
+        size=session["parsed"]["size"],
+        max_price=session["parsed"]["max_price"],
+    )
+    session["search_results"] = results
+
+    # Step 4 (branch): No matches → stop early, do NOT call the other tools.
+    if not results:
+        session["error"] = (
+            "I couldn't find any listings that match your request. "
+            "Try a broader description, a higher max price, or removing the "
+            "size filter."
+        )
+        return session
+
+    # Select the top result to style.
+    session["selected_item"] = results[0]
+
+    # Step 5: Suggest an outfit using the selected item and wardrobe.
+    outfit = suggest_outfit(
+        new_item=session["selected_item"],
+        wardrobe=session["wardrobe"],
+    )
+    session["outfit_suggestion"] = outfit
+
+    # Guard: suggest_outfit should always return text, but if it somehow does
+    # not, stop before building a fit card from empty input.
+    if not outfit or not outfit.strip():
+        session["error"] = (
+            "I found a listing, but I couldn't generate an outfit suggestion. "
+            "Try again with a different item or wardrobe."
+        )
+        return session
+
+    # Step 6: Build a shareable fit card from the outfit + selected item.
+    session["fit_card"] = create_fit_card(
+        outfit=session["outfit_suggestion"],
+        new_item=session["selected_item"],
+    )
+
+    # Step 7: Return the completed session.
     return session
 
 
